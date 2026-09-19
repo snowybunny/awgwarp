@@ -22,6 +22,13 @@ AWG_WARP_CLIENTS="$AWG_WARP_DIR/clients.list"
 AWG_MARKER_BEGIN="# --- AWGWARP-MANAGER BEGIN ---"
 AWG_MARKER_END="# --- AWGWARP-MANAGER END ---"
 
+# IPv6-endpoint для контейнера без нативного IPv6: локальный UDP-relay на
+# ХОСТЕ (systemd + socat), пробрасывающий IPv4 (видимый контейнеру) на
+# настоящий IPv6-адрес. Живёт независимо от контейнера — переживает его
+# рестарты и перезагрузку хоста (systemd enable).
+AWG_RELAY_UNIT="awgwarp-ipv6-relay"
+AWG_RELAY_SERVICE_FILE="/etc/systemd/system/${AWG_RELAY_UNIT}.service"
+
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'
 YELLOW='\033[1;33m'; MAGENTA='\033[0;35m'; WHITE='\033[1;37m'
@@ -55,11 +62,13 @@ WARP_PLAN="free"
 WGCF_ORIGINAL_LICENSE=""
 WARP_LICENSE_ASKED="0"
 WARP_ENDPOINT_OVERRIDE=""
-LOG_ENABLED="0"
+WARP_RELAY_ENABLED="0"
+WARP_ENDPOINT_REAL=""
+WARP_RELAY_PORT=""
+WARP_RELAY_GATEWAY=""
 CONF
     fi
     source "$WARP_CONF"
-    LOG_ENABLED="${LOG_ENABLED:-0}"
 }
 
 save_config_val() {
@@ -76,36 +85,7 @@ save_config_val() {
 #  LOGGING / SYSTEM
 # ═══════════════════════════════════════════════════════════════
 
-log_action() { [ "${LOG_ENABLED:-0}" = "1" ] && echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$WARP_LOG"; return 0; }
-
-log_toggle_menu() {
-  while true; do
-    clear
-    echo -e "\n${CYAN}━━━ Логирование (${WARP_LOG}) ━━━${NC}\n"
-    if [ "${LOG_ENABLED:-0}" = "1" ]; then
-      echo -e "  Статус: ${GREEN}Включено${NC}"
-    else
-      echo -e "  Статус: ${YELLOW}Выключено${NC} ${DIM}(по умолчанию)${NC}"
-    fi
-    echo -e "\n  1) Включить"
-    echo -e "  2) Выключить"
-    echo -e "  3) Показать последние записи лога"
-    echo -e "  4) Очистить лог-файл"
-    echo -e "  0) Назад"
-    read -p "  Выбор: " c
-    case "$c" in
-      1) save_config_val "LOG_ENABLED" "1"; log_action "LOG: логирование включено"
-         echo -e "${GREEN}✓ Включено${NC}"; read -p "Enter..." ;;
-      2) log_action "LOG: логирование выключено"; save_config_val "LOG_ENABLED" "0"
-         echo -e "${YELLOW}✓ Выключено${NC}"; read -p "Enter..." ;;
-      3) clear; echo -e "\n${CYAN}━━━ Последние записи ━━━${NC}\n"
-         [ -f "$WARP_LOG" ] && tail -n 50 "$WARP_LOG" || echo -e "${DIM}(лог пуст или не создан)${NC}"
-         echo ""; read -p "Enter..." ;;
-      4) rm -f "$WARP_LOG"; echo -e "${GREEN}✓ Лог очищен${NC}"; read -p "Enter..." ;;
-      0) return ;;
-    esac
-  done
-}
+log_action() { :; }
 
 check_root() {
     [ "$EUID" -ne 0 ] && { echo -e "${RED}[ERROR] Запустите от root!${NC}"; exit 1; }
@@ -506,6 +486,141 @@ awg_set_endpoint() {
     awg_detect_warp_exit_ip
     log_action "AWG ENDPOINT: set to ${val:-auto} (resolved: ${ep}), connectivity=ok"
     return 0
+}
+
+# ── IPv6-endpoint через локальный UDP-relay (socat) ──────────────────────
+# Докер-сеть контейнера AmneziaWG может не поддерживать IPv6 вообще (нет
+# ни адреса, ни маршрута на eth0) — тогда WireGuard-интерфейс "warp" внутри
+# контейнера физически не может достучаться до IPv6-адреса напрямую.
+# Решение: вместо прямого IPv6 в warp.conf прописывается ЛОКАЛЬНЫЙ IPv4-адрес
+# (gateway докер-сети, который контейнер и так видит по обычному IPv4), а
+# отдельный systemd-сервис на ХОСТЕ слушает этот адрес и пересылает UDP на
+# настоящий IPv6-endpoint через socat. Контейнер думает, что просто ходит
+# по IPv4 — про IPv6 ему знать не нужно.
+# Это полностью переживает рестарт контейнера (relay — процесс хоста, не
+# внутри контейнера) и переживает reboot хоста (systemd enable).
+
+# Gateway, через который контейнер видит хост — сюда relay должен слушать,
+# чтобы контейнер мог до него достучаться обычным IPv4.
+awg_get_container_gateway() {
+    docker exec "$CONTAINER" sh -c "ip route show default 2>/dev/null | awk '/default/ {print \$3; exit}'" 2>/dev/null
+}
+
+# Свободный UDP-порт на хосте начиная с 62408 (осознанно далеко от типичных
+# портов WireGuard/WARP, чтобы не пересекаться с самим WARP).
+awg_find_free_udp_port() {
+    local port=62408
+    while ss -uln 2>/dev/null | awk '{print $5}' | grep -q ":${port}\$"; do
+        port=$((port + 1))
+        [ "$port" -gt 65535 ] && return 1
+    done
+    echo "$port"
+}
+
+awg_relay_is_active() {
+    systemctl is-active --quiet "$AWG_RELAY_UNIT" 2>/dev/null
+}
+
+# Проверяет наличие socat; если нет — спрашивает пользователя, устанавливать
+# ли. Возврат 0 = socat в итоге доступен (был или только что поставлен),
+# 1 = пользователь отказался, либо установка не удалась — ничего не менять.
+awg_ensure_socat() {
+    command -v socat &>/dev/null && return 0
+    echo -e "\n${YELLOW}Для IPv6-endpoint нужен пакет 'socat' (локальный UDP-relay) — сейчас он не установлен.${NC}"
+    read -p "  Установить socat? (y/n): " ans
+    if [[ "$ans" != "y" ]]; then
+        echo -e "${RED}Отменено — socat не установлен, endpoint не изменён.${NC}"
+        return 1
+    fi
+    echo -e "${CYAN}Устанавливаю socat...${NC}"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >/dev/null 2>&1
+    apt-get install -y socat >/dev/null 2>&1
+    if ! command -v socat &>/dev/null; then
+        echo -e "${RED}Не удалось установить socat. Endpoint не изменён.${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}socat установлен.${NC}"
+    return 0
+}
+
+# Поднимает/обновляет systemd-relay: слушает на gateway контейнера и
+# пересылает на настоящий IPv6-адрес $1 (формат "[ipv6]:port"). При успехе
+# печатает в stdout "gateway:port" — именно это нужно прописать как обычный
+# IPv4 Endpoint в самом WireGuard-конфиге. При неудаче ничего не печатает
+# и возвращает 1 (вызывающий код не должен использовать пустой вывод).
+awg_setup_ipv6_relay() {
+    local target="$1"
+    local gw port
+
+    gw=$(awg_get_container_gateway)
+    if [ -z "$gw" ]; then
+        echo -e "${RED}Не удалось определить gateway контейнера (docker network) — relay не создан.${NC}" >&2
+        return 1
+    fi
+
+    # Если relay уже настроен на этот же gateway — переиспользуем тот же
+    # порт, чтобы не плодить порты при каждой смене IPv6-эндпоинта.
+    if [ "${WARP_RELAY_ENABLED:-0}" = "1" ] && [ "${WARP_RELAY_GATEWAY:-}" = "$gw" ] && [ -n "${WARP_RELAY_PORT:-}" ]; then
+        port="$WARP_RELAY_PORT"
+    else
+        port=$(awg_find_free_udp_port)
+        if [ -z "$port" ]; then
+            echo -e "${RED}Не нашёл свободный UDP-порт для relay.${NC}" >&2
+            return 1
+        fi
+    fi
+
+    cat > "$AWG_RELAY_SERVICE_FILE" <<EOF
+[Unit]
+Description=AWGWARP IPv6 relay: ${gw}:${port} (IPv4, docker) -> ${target} (IPv6)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat -T60 UDP4-LISTEN:${port},bind=${gw},reuseaddr,fork UDP6:${target}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now "$AWG_RELAY_UNIT" >/dev/null 2>&1
+    sleep 1
+
+    if ! awg_relay_is_active; then
+        echo -e "${RED}Relay-сервис не запустился (journalctl -u ${AWG_RELAY_UNIT} для деталей).${NC}" >&2
+        return 1
+    fi
+    if ! ss -uln 2>/dev/null | grep -q "${gw}:${port}"; then
+        echo -e "${RED}Relay запущен, но не слушает ${gw}:${port} — что-то не так.${NC}" >&2
+        return 1
+    fi
+
+    save_config_val "WARP_RELAY_ENABLED" "1"
+    save_config_val "WARP_RELAY_PORT" "$port"
+    save_config_val "WARP_RELAY_GATEWAY" "$gw"
+    save_config_val "WARP_ENDPOINT_REAL" "$target"
+
+    echo "${gw}:${port}"
+    return 0
+}
+
+# Полностью убирает relay: останавливает и удаляет systemd-сервис, чистит
+# связанные поля конфига. Используется при сбросе на автоматический
+# endpoint, при переходе на обычный (не-IPv6) endpoint, и при полном
+# удалении WARP.
+awg_teardown_ipv6_relay() {
+    systemctl disable --now "$AWG_RELAY_UNIT" >/dev/null 2>&1
+    rm -f "$AWG_RELAY_SERVICE_FILE"
+    systemctl daemon-reload >/dev/null 2>&1
+    save_config_val "WARP_RELAY_ENABLED" "0"
+    save_config_val "WARP_ENDPOINT_REAL" ""
+    save_config_val "WARP_RELAY_PORT" ""
+    save_config_val "WARP_RELAY_GATEWAY" ""
 }
 
 awg_build_warp_conf() {
@@ -948,7 +1063,11 @@ awg_warp_settings_menu() {
         fi
         if is_warp_installed_awg; then
             local cur_ep; cur_ep=$(awg_get_active_endpoint)
-            if [ -n "${WARP_ENDPOINT_OVERRIDE:-}" ]; then
+            if [ "${WARP_RELAY_ENABLED:-0}" = "1" ] && [ -n "${WARP_ENDPOINT_REAL:-}" ]; then
+                local relay_st="${RED}не отвечает${NC}"
+                awg_relay_is_active && relay_st="${GREEN}активен${NC}"
+                echo -e "  ${WHITE}Endpoint:${NC}          ${CYAN}${WARP_ENDPOINT_REAL}${NC} ${DIM}(через локальный relay ${cur_ep:-$WARP_ENDPOINT_OVERRIDE}, socat: $(echo -e "$relay_st"))${NC}"
+            elif [ -n "${WARP_ENDPOINT_OVERRIDE:-}" ]; then
                 echo -e "  ${WHITE}Endpoint:${NC}          ${CYAN}${cur_ep:-$WARP_ENDPOINT_OVERRIDE}${NC} ${DIM}(задан вручную)${NC}"
             else
                 echo -e "  ${WHITE}Endpoint:${NC}          ${CYAN}${cur_ep:-автоматически}${NC} ${DIM}(auto: engage.cloudflareclient.com)${NC}"
@@ -1011,6 +1130,7 @@ awg_warp_settings_menu() {
                 echo -e "  ${CYAN}162.159.192.1:2408${NC}"
                 echo -e "  ${CYAN}[2602:fc59:b0:64::a29f:c08d]:2408${NC}"
                 echo -e "${DIM}(рабочие порты Cloudflare WARP: 2408, 500, 1701, 4500, 4443, 8095, 8886, 51820)${NC}"
+                echo -e "${DIM}IPv6-адрес автоматически пойдёт через локальный relay (socat) — контейнеру IPv6 не нужен.${NC}"
                 echo -e "${YELLOW}Внимание: контейнер будет перезапущен — все VPN-клиенты на пару секунд отключатся.${NC}"
                 read -p "  Введите Endpoint: " newep
                 newep=$(echo "$newep" | xargs)
@@ -1018,12 +1138,53 @@ awg_warp_settings_menu() {
                 if ! awg_is_valid_endpoint "$newep"; then
                     echo -e "\n${RED}Неверный формат. Нужно IP:PORT или [IPv6]:PORT.${NC}"; read -p "Enter..."; continue
                 fi
+
+                local actual_ep="$newep" is_ipv6_relay=0
+                local had_relay="${WARP_RELAY_ENABLED:-0}" relay_backup="" old_real="${WARP_ENDPOINT_REAL:-}"
+                local old_port="${WARP_RELAY_PORT:-}" old_gw="${WARP_RELAY_GATEWAY:-}"
+
+                if [[ "$newep" =~ ^\[ ]]; then
+                    is_ipv6_relay=1
+                    awg_ensure_socat || { read -p "Enter..."; continue; }
+                    [ "$had_relay" = "1" ] && [ -f "$AWG_RELAY_SERVICE_FILE" ] && relay_backup=$(cat "$AWG_RELAY_SERVICE_FILE")
+                    echo -e "\n${CYAN}Настраиваю локальный IPv6-relay...${NC}"
+                    actual_ep=$(awg_setup_ipv6_relay "$newep")
+                    if [ -z "$actual_ep" ]; then
+                        echo -e "\n${RED}Не удалось настроить relay — endpoint не изменён.${NC}"
+                        read -p "Enter..."; continue
+                    fi
+                    echo -e "${GREEN}Relay настроен: ${newep} -> локально ${actual_ep}${NC}"
+                fi
+
                 echo -e "\n${YELLOW}Перезапускаю контейнер и проверяю связь...${NC}"
-                if awg_set_endpoint "$newep"; then
-                    echo -e "\n${GREEN}[OK] Endpoint изменён на ${newep} и рабочий.${NC}"
+                if awg_set_endpoint "$actual_ep"; then
+                    if [ "$is_ipv6_relay" -eq 1 ]; then
+                        echo -e "\n${GREEN}[OK] Endpoint изменён на ${newep} (через локальный relay ${actual_ep}) и рабочий.${NC}"
+                    else
+                        echo -e "\n${GREEN}[OK] Endpoint изменён на ${newep} и рабочий.${NC}"
+                        # переключились на прямой (не-IPv6) endpoint — если relay был активен, он больше не нужен
+                        [ "$had_relay" = "1" ] && awg_teardown_ipv6_relay
+                    fi
                 else
                     echo -e "\n${RED}[!] Этот endpoint не отвечает — автоматически откачен на предыдущий рабочий.${NC}"
                     echo -e "${WHITE}    Попробуйте ввести другой IP:PORT.${NC}"
+                    if [ "$is_ipv6_relay" -eq 1 ]; then
+                        if [ "$had_relay" = "1" ] && [ -n "$relay_backup" ]; then
+                            # relay уже был настроен на ДРУГОЙ endpoint до этой попытки —
+                            # восстанавливаем именно его, чтобы откат awg_set_endpoint
+                            # (который вернул старый локальный gw:port) реально заработал
+                            echo "$relay_backup" > "$AWG_RELAY_SERVICE_FILE"
+                            systemctl daemon-reload >/dev/null 2>&1
+                            systemctl restart "$AWG_RELAY_UNIT" >/dev/null 2>&1
+                            save_config_val "WARP_ENDPOINT_REAL" "$old_real"
+                            save_config_val "WARP_RELAY_PORT" "$old_port"
+                            save_config_val "WARP_RELAY_GATEWAY" "$old_gw"
+                            save_config_val "WARP_RELAY_ENABLED" "1"
+                        else
+                            # relay был создан заново специально для этой попытки — убираем целиком
+                            awg_teardown_ipv6_relay
+                        fi
+                    fi
                 fi
                 read -p "Enter..." ;;
             5)
@@ -1031,6 +1192,7 @@ awg_warp_settings_menu() {
                 echo ""
                 if awg_set_endpoint ""; then
                     echo -e "\n${GREEN}[OK] Endpoint сброшен на автоматический и рабочий.${NC}"
+                    [ "${WARP_RELAY_ENABLED:-0}" = "1" ] && awg_teardown_ipv6_relay
                 else
                     echo -e "\n${RED}[!] Автоматический endpoint тоже не отвечает — откачен на предыдущий.${NC}"
                 fi
@@ -1197,11 +1359,11 @@ full_uninstall() {
 
     uninstall_awg
 
-    rm -f "$NIGHTLY_CRON_FILE" 2>/dev/null
-    echo -e "  ${GREEN}✓${NC}  Ночное автообслуживание (cron)"
+    awg_teardown_ipv6_relay
+    echo -e "  ${GREEN}✓${NC}  IPv6-relay (systemd)"
 
     rm -rf "$WARP_DIR" "$WARP_LOG"
-    echo -e "  ${GREEN}✓${NC}  Конфигурация и логи"
+    echo -e "  ${GREEN}✓${NC}  Конфигурация"
     rm -f /usr/local/bin/awgwarp
     echo -e "  ${GREEN}✓${NC}  Команда awgwarp"
 
@@ -1211,130 +1373,6 @@ full_uninstall() {
     log_action "UNINSTALL: full removal (amnezia)"
     read -p "Enter..."
     exit 0
-}
-
-# ═══════════════════════════════════════════════════════════════
-#  NIGHTLY MAINTENANCE — автообновление WARP + рестарт в 03:00
-# ═══════════════════════════════════════════════════════════════
-
-NIGHTLY_CRON_FILE="/etc/cron.d/awgwarp-manager-nightly"
-
-nightly_cron_status() {
-  [ -f "$NIGHTLY_CRON_FILE" ] && echo "on" || echo "off"
-}
-
-install_nightly_cron() {
-  cat > "$NIGHTLY_CRON_FILE" <<EOF
-# AWGWARP Manager: ночное автообслуживание (проверка обновлений + рестарт), ежедневно в 03:00
-0 3 * * * root /usr/local/bin/awgwarp --nightly-maintenance >/dev/null 2>&1
-EOF
-  chmod 644 "$NIGHTLY_CRON_FILE"
-  systemctl restart cron 2>/dev/null || systemctl restart crond 2>/dev/null || true
-  log_action "NIGHTLY: автообслуживание включено (03:00 ежедневно)"
-}
-
-remove_nightly_cron() {
-  rm -f "$NIGHTLY_CRON_FILE"
-  log_action "NIGHTLY: автообслуживание выключено"
-}
-
-# ── AmneziaWG: проверка обновления бинарника wgcf, без потери аккаунта/лицензии ──
-nightly_update_wgcf() {
-  [ -x "$WGCF_BIN" ] || return 0
-
-  local latest
-  latest=$(curl -4 -s --max-time 10 "https://api.github.com/repos/ViRb3/wgcf/releases/latest" 2>/dev/null \
-    | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//')
-
-  if [ -z "$latest" ] || [ "$latest" = "${WGCF_VERSION}" ]; then
-    log_action "NIGHTLY AWG: wgcf без изменений (версия ${WGCF_VERSION})"
-    return 0
-  fi
-
-  local arch wa
-  arch=$(uname -m)
-  case "$arch" in
-    x86_64) wa="amd64" ;;
-    aarch64) wa="arm64" ;;
-    armv7l) wa="armv7" ;;
-    *) log_action "NIGHTLY AWG: неизвестная архитектура $arch, пропуск"; return 0 ;;
-  esac
-
-  local tmp_bin="/root/wgcf.new"
-  if robust_download "https://github.com/ViRb3/wgcf/releases/download/v${latest}/wgcf_${latest}_linux_${wa}" "$tmp_bin" \
-    && chmod +x "$tmp_bin" && "$tmp_bin" --version >/dev/null 2>&1; then
-    mv -f "$tmp_bin" "$WGCF_BIN"
-    save_config_val "WGCF_VERSION" "$latest"
-    WGCF_VERSION="$latest"
-    log_action "NIGHTLY AWG: wgcf обновлён до ${latest} (аккаунт и лицензия сохранены)"
-  else
-    rm -f "$tmp_bin"
-    log_action "NIGHTLY AWG: ВНИМАНИЕ — не удалось скачать/проверить wgcf ${latest}, оставлена текущая версия"
-  fi
-}
-
-# ── Рестарт контейнера — точная копия рестарта после сохранения клиентов WARP ──
-nightly_restart_awg_container() {
-  [ -z "${CONTAINER:-}" ] && return 0
-
-  echo -e "\n${YELLOW}  Перезапуск контейнера ${CONTAINER}...${NC}"
-  docker restart "$CONTAINER" >/dev/null 2>&1
-  local a=0
-  while [ "$a" -lt 15 ]; do
-    docker exec "$CONTAINER" sh -c "true" 2>/dev/null && break
-    sleep 1; ((a++))
-  done
-  if docker exec "$CONTAINER" sh -c "true" 2>/dev/null; then
-    echo -e "${GREEN}  ✓ Контейнер перезапущен${NC}"
-    log_action "NIGHTLY AWG: контейнер перезапущен успешно"
-  else
-    echo -e "${RED}  ⚠ Контейнер не отвечает${NC}"
-    log_action "NIGHTLY AWG: ВНИМАНИЕ — контейнер не отвечает после рестарта"
-  fi
-}
-
-nightly_maintenance() {
-  init_config
-  get_my_ip >/dev/null 2>&1
-
-  log_action "NIGHTLY: старт автообслуживания"
-
-  if awg_pick_container 2>/dev/null; then
-    awg_load_container_data 2>/dev/null
-    nightly_update_wgcf
-    nightly_restart_awg_container
-  else
-    log_action "NIGHTLY AWG: контейнер не найден, пропуск"
-  fi
-
-  log_action "NIGHTLY: автообслуживание завершено"
-}
-
-nightly_cron_menu() {
-  while true; do
-    clear
-    local st; st=$(nightly_cron_status)
-    echo -e "\n${CYAN}━━━ Ночное автообслуживание (03:00) ━━━${NC}\n"
-    if [ "$st" = "on" ]; then
-      echo -e "  Статус: ${GREEN}Включено${NC}"
-    else
-      echo -e "  Статус: ${YELLOW}Выключено${NC}"
-    fi
-    echo -e "\n  Каждую ночь в ${WHITE}03:00${NC} будет выполняться:"
-    echo -e "   ${DIM}•${NC} Проверка обновления wgcf + рестарт контейнера ${CONTAINER:-} (даже без обновлений)"
-    echo ""
-    echo -e "  1) Включить"
-    echo -e "  2) Выключить"
-    echo -e "  3) Запустить сейчас (тест)"
-    echo -e "  0) Назад"
-    read -p "  Выбор: " c
-    case "$c" in
-      1) install_nightly_cron; echo -e "${GREEN}✓ Включено${NC}"; read -p "Enter..." ;;
-      2) remove_nightly_cron; echo -e "${YELLOW}✓ Выключено${NC}"; read -p "Enter..." ;;
-      3) nightly_maintenance; echo -e "${GREEN}✓ Выполнено. Лог: ${WARP_LOG}${NC}"; read -p "Enter..." ;;
-      0) return ;;
-    esac
-  done
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -1372,17 +1410,9 @@ show_menu() {
         fi
         echo -e "  7) 🔐 ${CYAN}Настройки WARP (License / Endpoint)${NC} ${DIM}(план: ${plan_short})${NC}"
 
-        echo -e "\n${CYAN}── Автообслуживание ────────────────────────────────────${NC}"
-        local ncs ncs_label lg_label
-        ncs=$(nightly_cron_status)
-        ncs_label="${YELLOW}Выкл${NC}"; [ "$ncs" = "on" ] && ncs_label="${GREEN}Вкл${NC}"
-        echo -e "  8) 🌙 ${CYAN}Ночное обслуживание (03:00)${NC} ${DIM}(статус: ${NC}${ncs_label}${DIM})${NC}"
-        lg_label="${YELLOW}Выкл${NC}"; [ "${LOG_ENABLED:-0}" = "1" ] && lg_label="${GREEN}Вкл${NC}"
-        echo -e "  9) 📝 ${CYAN}Логирование в awgwarp-manager.log${NC} ${DIM}(статус: ${NC}${lg_label}${DIM})${NC}"
-
         echo -e "\n${CYAN}── Прочее ─────────────────────────────────────────────${NC}"
-        echo -e " 10) ${MAGENTA}📚 Инструкция${NC}"
-        echo -e " 11) ${RED}⚠  Полное удаление${NC}"
+        echo -e "  8) ${MAGENTA}📚 Инструкция${NC}"
+        echo -e "  9) ${RED}⚠  Полное удаление${NC}"
         echo -e "  0) Выход"
         echo -e "${CYAN}──────────────────────────────────────────────────────${NC}"
         read -p "  Выбор: " ch
@@ -1395,10 +1425,8 @@ show_menu() {
             5)  rekey_warp_awg ;;
             6)  awg_toggle_clients_ssh ;;
             7)  awg_warp_settings_menu ;;
-            8)  nightly_cron_menu ;;
-            9)  log_toggle_menu ;;
-            10) show_info ;;
-            11) full_uninstall ;;
+            8)  show_info ;;
+            9)  full_uninstall ;;
             0)  exit 0 ;;
         esac
     done
@@ -1498,6 +1526,5 @@ run_startup() {
 # ═══════════════════════════════════════════════════════════════
 
 case "${1:-}" in
-    --nightly-maintenance) nightly_maintenance ;;
     *) init_config; run_startup ;;
 esac
