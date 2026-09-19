@@ -1,31 +1,48 @@
-**Киллер фичи (Killer features)**
+# AWGWARP Manager v0.1
 
-1. Возможность подключиться к WARP+
+Каскадный VPN на основе Cloudflare WARP через AmneziaWG (AWG).  
+(Cascading VPN based on Cloudflare WARP via AmneziaWG)
+
+**Схема (Scheme):** `Клиент ← VPS ← AWG ← WARP`  
+(`Client ← VPS ← AWG ← WARP`)
+
+Для полноценной работы требуются права **root**.  
+(Root privileges are required for full functionality)
+
+---
+
+## Киллер-фичи (Killer features)
+
+1. Возможность подключиться к **WARP+**
 2. Замена endpoint на любой, в том числе IPv6 (через socat)
-3. На основе замены endpoint с NAT64 можно сделать “soultransfer”
+3. На основе замены endpoint с NAT64 можно сделать **“soultransfer”**
 4. Безотказная работа после перезагрузки машины (персистентность)
 
-**Быстрая настройка (How to use)**
+---
 
-Установка (install):
+## Быстрая настройка (How to use)
+
+### Установка (Install)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/snowybunny/awgwarp/main/script.sh -o /tmp/awgwarp-install.sh && bash /tmp/awgwarp-install.sh
 ```
 
-После установки, запуск командой (after):
+### Запуск (Run)
 
 ```bash
 awgwarp
 ```
 
-**Поддерживаемые системы (OS support)**
+---
 
-| OS      | Version | Support |
-|---------|---------|---------|
-| Ubuntu  | 20.04   | yes     |
-| Ubuntu  | 22.04   | yes     |
-| Ubuntu  | 24.04   | yes     |
-| Debian  | 11      | yes     |
-| Debian  | 12      | yes     |
-| Debian  | 13      | yes     |
+## Поддерживаемые системы (OS support)
+
+| ОС (OS)  | Версия (Version) | Поддержка (Support) |
+|----------|------------------|---------------------|
+| Ubuntu   | 20.04            | ✅                  |
+| Ubuntu   | 22.04            | ✅                  |
+| Ubuntu   | 24.04            | ✅                  |
+| Debian   | 11               | ✅                  |
+| Debian   | 12               | ✅                  |
+| Debian   | 13               | ✅                  |
