@@ -1,13 +1,17 @@
+[![Status](https://img.shields.io/badge/status-alpha-orange?style=flat-square)](https://github.com/snowybunny/awgwarp)
+[![Version](https://img.shields.io/badge/version-0.1-blue?style=flat-square)](https://github.com/snowybunny/awgwarp)
+[![Platform](https://img.shields.io/badge/platform-Linux-lightgrey?style=flat-square)](https://github.com/snowybunny/awgwarp)
+[![Ubuntu](https://img.shields.io/badge/Ubuntu-20.04%20%7C%2022.04%20%7C%2024.04-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
+[![Debian](https://img.shields.io/badge/Debian-11%20%7C%2012%20%7C%2013-A81D33?style=flat-square&logo=debian&logoColor=white)](https://www.debian.org/)
+[![Bash](https://img.shields.io/badge/Bash-script-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
+
 # AWGWARP Manager v0.1
 
-Каскадный VPN на основе Cloudflare WARP через AmneziaWG (AWG).  
-(Cascading VPN based on Cloudflare WARP via AmneziaWG)
+Каскадный VPN на основе Cloudflare WARP через AmneziaWG (Cascading VPN based on Cloudflare WARP via AmneziaWG).
 
-**Схема (Scheme):** `Клиент ← VPS ← AWG ← WARP`  
-(`Client ← VPS ← AWG ← WARP`)
+**Схема (Scheme):** `Клиент ← VPS ← AWG ← WARP`
 
-Для полноценной работы требуются права **root**.  
-(Root privileges are required for full functionality)
+Для полноценной работы требуются права **root**. (Root privileges are required for full functionality)
 
 ---
 

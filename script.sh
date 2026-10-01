@@ -22,10 +22,8 @@ AWG_WARP_CLIENTS="$AWG_WARP_DIR/clients.list"
 AWG_MARKER_BEGIN="# --- AWGWARP-MANAGER BEGIN ---"
 AWG_MARKER_END="# --- AWGWARP-MANAGER END ---"
 
-# IPv6-endpoint для контейнера без нативного IPv6: локальный UDP-relay на
-# ХОСТЕ (systemd + socat), пробрасывающий IPv4 (видимый контейнеру) на
-# настоящий IPv6-адрес. Живёт независимо от контейнера — переживает его
-# рестарты и перезагрузку хоста (systemd enable).
+# systemd-юнит UDP-relay на хосте (socat): пересылает UDP с IPv4-адреса,
+# видимого контейнеру, на IPv6-endpoint.
 AWG_RELAY_UNIT="awgwarp-ipv6-relay"
 AWG_RELAY_SERVICE_FILE="/etc/systemd/system/${AWG_RELAY_UNIT}.service"
 
@@ -217,8 +215,7 @@ awg_backup() {
     log_action "AWG BACKUP: $ts"
 }
 
-# Скачивание файла с принудительным IPv4 (частая причина обрывов на VPS с
-# нерабочим/недомаршрутизируемым IPv6) + ретраи + фолбэк curl <-> wget.
+# Скачивает файл по IPv4 через curl (фолбэк — wget), с ретраями.
 robust_download() {
     local url="$1" out="$2"
     if command -v curl >/dev/null 2>&1; then
@@ -258,8 +255,8 @@ awg_ensure_account() {
     fi
     [ -f "$WGCF_ACCOUNT" ] || { echo -e "${RED}Не создан $WGCF_ACCOUNT${NC}"; return 1; }
 
-    # Запоминаем "родной" (free) license_key аккаунта один раз — он нужен для
-    # безопасного отката на Free, если активация WARP+ когда-либо не удастся.
+    # Сохраняет исходный license_key аккаунта в WGCF_ORIGINAL_LICENSE
+    # (используется при откате на Free).
     if [ "$fresh" -eq 1 ] || [ -z "${WGCF_ORIGINAL_LICENSE:-}" ]; then
         if [ "$fresh" -eq 1 ] || [ "${WARP_PLAN:-free}" != "plus" ]; then
             local lic; lic=$(awg_get_current_license)
@@ -299,10 +296,9 @@ awg_detect_warp_plan() {
     else echo "unknown"; fi
 }
 
-# Несколько попыток проверить, что интерфейс warp реально доходит до
-# Cloudflare (а не просто поднялся локально — wg-quick up "успевает" даже
-# с нерабочим endpoint, реальный handshake при этом не происходит).
-# Возвращает "plus"/"free" при успехе, "unknown" если так и не достучались.
+# Проверяет, что интерфейс warp получает ответ от Cloudflare (до $1
+# попыток, по умолчанию 3). Выводит "plus"/"free"; если связи нет —
+# "unknown" и код возврата 1.
 awg_wait_warp_connectivity() {
     local tries="${1:-3}" i plan
     for ((i = 1; i <= tries; i++)); do
@@ -317,24 +313,12 @@ awg_wait_warp_connectivity() {
     return 1
 }
 
-# Полный провижининг WARP (AmneziaWG): опционально пересоздаёт аккаунт,
-# привязывает License Key, генерирует профиль, поднимает интерфейс,
-# проверяет реальный план и применяет клиентские правила.
-#
-#   $1 — License Key ("" = оставаться на Free)
-#   $2 — "1" = принудительно пересоздать аккаунт wgcf, даже если он уже есть
-#
-# ВАЖНО про WARP+: у Cloudflare есть известный баг — если аккаунт wgcf уже
-# хоть раз подключался как Free, привязка лицензии к нему часто не поднимает
-# статус до "plus". Поэтому при непустом License Key аккаунт ВСЕГДА
-# пересоздаётся заново и лицензия привязывается ДО первого подключения.
-#
-# Откат на Free (awg_fallback_to_free) происходит ТОЛЬКО если Cloudflare API
-# явно отклонил лицензию (ошибка в ответе `wgcf update`). Если API принял
-# ключ (success), конфигурация с этим ключом сохраняется как есть — даже
-# если проверка через trace ("cdn-cgi/trace") пока показывает не "plus":
-# это может быть задержка применения на стороне Cloudflare или особенность
-# конкретного типа аккаунта, а не признак того, что ключ не сработал.
+# Полная настройка WARP: пересоздаёт аккаунт wgcf (при $2=1 или непустом
+# License Key), привязывает License Key, генерирует профиль и warp.conf,
+# поднимает интерфейс, определяет план, применяет правила клиентов.
+# Если Cloudflare отклонил лицензию — откат на Free (awg_fallback_to_free).
+#   $1 — License Key ("" = Free)
+#   $2 — "1" = принудительно пересоздать аккаунт wgcf
 awg_do_provision() {
     local lic_key="$1" force_fresh="${2:-0}"
 
@@ -380,9 +364,8 @@ awg_do_provision() {
     return 0
 }
 
-# Откат на бесплатный WARP: восстанавливает "родной" license_key аккаунта
-# и пересобирает профиль/конфиг/интерфейс. Вызывается при ЛЮБОЙ ошибке
-# активации WARP+ (изнутри awg_do_provision), а также вручную из меню License.
+# Откат на Free: восстанавливает исходный license_key аккаунта,
+# пересобирает профиль и warp.conf, поднимает интерфейс.
 awg_fallback_to_free() {
     echo -e "${YELLOW}  [*] Откат на бесплатный WARP (Free)...${NC}"
     if [ -f "$WGCF_ACCOUNT" ]; then
@@ -423,11 +406,7 @@ awg_get_active_endpoint() {
     docker exec "$CONTAINER" sh -c "awk -F' = ' '/^Endpoint/{print \$2}' '$AWG_WARP_CONF'" 2>/dev/null
 }
 
-# Проверяет формат endpoint: IPv4:PORT (162.159.192.1:2408) либо
-# [IPv6]:PORT (например [2602:fc59:b0:64::a29f:c08d]:2408 — в т.ч. для
-# конструкций через NAT64-шлюзы). Порт должен быть в диапазоне 1-65535.
-# Фактическая работоспособность самого адреса проверяется отдельно, уже
-# после применения, через реальный handshake (awg_wait_warp_connectivity).
+# Проверяет формат endpoint: IPv4:PORT или [IPv6]:PORT, порт 1-65535.
 awg_is_valid_endpoint() {
     local val="$1" port
     if [[ "$val" =~ ^\[([0-9A-Fa-f:]+)\]:([0-9]{1,5})$ ]]; then
@@ -440,17 +419,10 @@ awg_is_valid_endpoint() {
     (( port >= 1 && port <= 65535 ))
 }
 
-# Меняет endpoint (IP:port) без пересоздания аккаунта/ключей — пересобирает
-# warp.conf и ПОЛНОСТЬЮ ПЕРЕЗАПУСКАЕТ КОНТЕЙНЕР (awg_reload_warp_interface),
-# т.к. простой wg-quick down/up внутри уже работающего контейнера иногда не
-# сбрасывает состояние интерфейса AmneziaWG — только чистый рестарт делает
-# это надёжно. После рестарта РЕАЛЬНО проверяется связь с Cloudflare (сам
-# wg-quick "успевает" даже с нерабочим endpoint — просто без handshake).
-# Если новый endpoint не отвечает — автоматически откатывается на
-# предыдущий (рабочий) endpoint, чтобы WARP не оставался нерабочим.
-# ВАЖНО: рестарт контейнера на несколько секунд обрывает ВСЕ VPN-соединения
-# через него, не только WARP.
-#   $1 — "ip:port" / "[ipv6]:port" или "" для сброса на автоматический (DNS engage.cloudflareclient.com)
+# Меняет endpoint и перезапускает контейнер. После рестарта
+# проверяется реальный handshake; если endpoint не отвечает — автооткат
+# на предыдущий рабочий. Рестарт на пару секунд обрывает ВСЕ VPN-соединения.
+#   $1 — "ip:port" / "[ipv6]:port" или "" (автоматический, DNS engage.cloudflareclient.com)
 awg_set_endpoint() {
     local val="$1"
     local prev_val="${WARP_ENDPOINT_OVERRIDE:-}"
@@ -489,25 +461,15 @@ awg_set_endpoint() {
 }
 
 # ── IPv6-endpoint через локальный UDP-relay (socat) ──────────────────────
-# Докер-сеть контейнера AmneziaWG может не поддерживать IPv6 вообще (нет
-# ни адреса, ни маршрута на eth0) — тогда WireGuard-интерфейс "warp" внутри
-# контейнера физически не может достучаться до IPv6-адреса напрямую.
-# Решение: вместо прямого IPv6 в warp.conf прописывается ЛОКАЛЬНЫЙ IPv4-адрес
-# (gateway докер-сети, который контейнер и так видит по обычному IPv4), а
-# отдельный systemd-сервис на ХОСТЕ слушает этот адрес и пересылает UDP на
-# настоящий IPv6-endpoint через socat. Контейнер думает, что просто ходит
-# по IPv4 — про IPv6 ему знать не нужно.
-# Это полностью переживает рестарт контейнера (relay — процесс хоста, не
-# внутри контейнера) и переживает reboot хоста (systemd enable).
+# В warp.conf прописывается IPv4 gateway контейнера; systemd-сервис на
+# хосте пересылает UDP с этого адреса на IPv6-endpoint через socat.
 
-# Gateway, через который контейнер видит хост — сюда relay должен слушать,
-# чтобы контейнер мог до него достучаться обычным IPv4.
+# Выводит IPv4 default gateway контейнера.
 awg_get_container_gateway() {
     docker exec "$CONTAINER" sh -c "ip route show default 2>/dev/null | awk '/default/ {print \$3; exit}'" 2>/dev/null
 }
 
-# Свободный UDP-порт на хосте начиная с 62408 (осознанно далеко от типичных
-# портов WireGuard/WARP, чтобы не пересекаться с самим WARP).
+# Выводит первый свободный UDP-порт на хосте начиная с 62408.
 awg_find_free_udp_port() {
     local port=62408
     while ss -uln 2>/dev/null | awk '{print $5}' | grep -q ":${port}\$"; do
@@ -521,9 +483,8 @@ awg_relay_is_active() {
     systemctl is-active --quiet "$AWG_RELAY_UNIT" 2>/dev/null
 }
 
-# Проверяет наличие socat; если нет — спрашивает пользователя, устанавливать
-# ли. Возврат 0 = socat в итоге доступен (был или только что поставлен),
-# 1 = пользователь отказался, либо установка не удалась — ничего не менять.
+# Проверяет наличие socat; если его нет — предлагает установить.
+# Возвращает 1, если пользователь отказался или установка не удалась.
 awg_ensure_socat() {
     command -v socat &>/dev/null && return 0
     echo -e "\n${YELLOW}Для IPv6-endpoint нужен пакет 'socat' (локальный UDP-relay) — сейчас он не установлен.${NC}"
@@ -544,11 +505,9 @@ awg_ensure_socat() {
     return 0
 }
 
-# Поднимает/обновляет systemd-relay: слушает на gateway контейнера и
-# пересылает на настоящий IPv6-адрес $1 (формат "[ipv6]:port"). При успехе
-# печатает в stdout "gateway:port" — именно это нужно прописать как обычный
-# IPv4 Endpoint в самом WireGuard-конфиге. При неудаче ничего не печатает
-# и возвращает 1 (вызывающий код не должен использовать пустой вывод).
+# Создаёт/обновляет systemd-relay: слушает на gateway контейнера и
+# пересылает UDP на IPv6-адрес $1 ("[ipv6]:port"). При успехе выводит
+# "gateway:port", при ошибке возвращает 1 без вывода.
 awg_setup_ipv6_relay() {
     local target="$1"
     local gw port
@@ -559,8 +518,7 @@ awg_setup_ipv6_relay() {
         return 1
     fi
 
-    # Если relay уже настроен на этот же gateway — переиспользуем тот же
-    # порт, чтобы не плодить порты при каждой смене IPv6-эндпоинта.
+    # Если relay уже настроен на этот gateway — использует прежний порт.
     if [ "${WARP_RELAY_ENABLED:-0}" = "1" ] && [ "${WARP_RELAY_GATEWAY:-}" = "$gw" ] && [ -n "${WARP_RELAY_PORT:-}" ]; then
         port="$WARP_RELAY_PORT"
     else
@@ -588,7 +546,8 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now "$AWG_RELAY_UNIT" >/dev/null 2>&1
+    systemctl enable "$AWG_RELAY_UNIT" >/dev/null 2>&1
+    systemctl restart "$AWG_RELAY_UNIT" >/dev/null 2>&1
     sleep 1
 
     if ! awg_relay_is_active; then
@@ -609,10 +568,7 @@ EOF
     return 0
 }
 
-# Полностью убирает relay: останавливает и удаляет systemd-сервис, чистит
-# связанные поля конфига. Используется при сбросе на автоматический
-# endpoint, при переходе на обычный (не-IPv6) endpoint, и при полном
-# удалении WARP.
+# Останавливает и удаляет systemd-relay, очищает связанные поля конфига.
 awg_teardown_ipv6_relay() {
     systemctl disable --now "$AWG_RELAY_UNIT" >/dev/null 2>&1
     rm -f "$AWG_RELAY_SERVICE_FILE"
@@ -654,13 +610,7 @@ awg_warp_up() {
     docker exec "$CONTAINER" sh -c "ip addr show warp >/dev/null 2>&1" || { echo -e "${RED}Интерфейс warp не поднялся.${NC}"; return 1; }
 }
 
-# Полный перезапуск контейнера — используется вместо wg-quick down/up,
-# когда меняется СОДЕРЖИМОЕ warp.conf на уже работающем интерфейсе
-# (новый endpoint, новый ключ после лицензии/rekey/отката на Free).
-# У AmneziaWG иногда остаётся "залипшее" состояние сокета/интерфейса,
-# которое простой down+up внутри того же контейнера не сбрасывает —
-# помогает только чистый рестарт контейнера (start.sh сам поднимет
-# интерфейс заново с уже обновлённым файлом конфигурации).
+# Перезапускает контейнер и ждёт, пока он начнёт отвечать (до 15 с).
 awg_reload_warp_interface() {
     docker restart "$CONTAINER" >/dev/null 2>&1
     local a=0
@@ -692,11 +642,8 @@ install_warp_awg() {
     echo -e "${YELLOW}[2/4]${NC} Скачиваю wgcf..."
     awg_install_wgcf || { read -p "Enter..."; return; }; echo -e "${GREEN}  ✓${NC}"
 
-    # ── WARP+ License: спрашиваем один раз при развёртывании каскада, ──
-    # ── ДО регистрации/подключения аккаунта (см. примечание к          ──
-    # ── awg_do_provision про баг Cloudflare с уже использованными      ──
-    # ── free-аккаунтами). Сохраняем ключ в конфиг только после того,   ──
-    # ── как Cloudflare его реально примет — невалидный ключ не висит.  ──
+    # Запрос WARP+ License Key (один раз, до регистрации аккаунта).
+    # В конфиг ключ сохраняется только после принятия Cloudflare.
     local lic_key="${WARP_LICENSE_KEY:-}"
     if [ -z "$lic_key" ] && [ "${WARP_LICENSE_ASKED:-0}" != "1" ]; then
         save_config_val "WARP_LICENSE_ASKED" "1"
@@ -1162,7 +1109,7 @@ awg_warp_settings_menu() {
                         echo -e "\n${GREEN}[OK] Endpoint изменён на ${newep} (через локальный relay ${actual_ep}) и рабочий.${NC}"
                     else
                         echo -e "\n${GREEN}[OK] Endpoint изменён на ${newep} и рабочий.${NC}"
-                        # переключились на прямой (не-IPv6) endpoint — если relay был активен, он больше не нужен
+                        # Прямой (не-IPv6) endpoint: удаляет relay, если он был активен
                         [ "$had_relay" = "1" ] && awg_teardown_ipv6_relay
                     fi
                 else
@@ -1170,9 +1117,8 @@ awg_warp_settings_menu() {
                     echo -e "${WHITE}    Попробуйте ввести другой IP:PORT.${NC}"
                     if [ "$is_ipv6_relay" -eq 1 ]; then
                         if [ "$had_relay" = "1" ] && [ -n "$relay_backup" ]; then
-                            # relay уже был настроен на ДРУГОЙ endpoint до этой попытки —
-                            # восстанавливаем именно его, чтобы откат awg_set_endpoint
-                            # (который вернул старый локальный gw:port) реально заработал
+                            # Relay был настроен до этой попытки — восстанавливает
+                            # его прежние unit-файл и параметры
                             echo "$relay_backup" > "$AWG_RELAY_SERVICE_FILE"
                             systemctl daemon-reload >/dev/null 2>&1
                             systemctl restart "$AWG_RELAY_UNIT" >/dev/null 2>&1
@@ -1181,7 +1127,7 @@ awg_warp_settings_menu() {
                             save_config_val "WARP_RELAY_GATEWAY" "$old_gw"
                             save_config_val "WARP_RELAY_ENABLED" "1"
                         else
-                            # relay был создан заново специально для этой попытки — убираем целиком
+                            # Relay создан для этой попытки — удаляет его
                             awg_teardown_ipv6_relay
                         fi
                     fi
@@ -1237,11 +1183,8 @@ awg_cleanup_rules() {
     ' >/dev/null 2>&1 || true
 }
 
-# Всегда работает с АКТУАЛЬНЫМ списком клиентов с диска (awg_load_clients),
-# а не с тем, что может (или не может) лежать в памяти на момент вызова —
-# иначе при вызове из меню License/Endpoint, минуя меню "Управление
-# клиентами", AWG_SELECTED_IPS был бы пуст и все правила маршрутизации
-# клиентов через warp стирались бы без восстановления.
+# Загружает список клиентов с диска, очищает прежние правила и добавляет
+# маршрутизацию выбранных клиентов через warp (ip rule + MASQUERADE).
 awg_apply_rules() {
     awg_load_clients
     awg_cleanup_rules
@@ -1461,15 +1404,10 @@ run_startup() {
     [ -s "/usr/local/bin/awgwarp" ] && upgrade_msg="обновлена (v${WARP_VERSION})"
     if [ "$(readlink -f "$0" 2>/dev/null)" != "/usr/local/bin/awgwarp" ]; then
         if [ -s "$0" ]; then
-            # $0 — реальный читаемый файл (обычный запуск: bash script.sh).
+            # $0 — обычный файл: копирует его
             cp -f "$0" "/usr/local/bin/awgwarp.tmp" 2>/dev/null
         else
-            # $0 не годится для копирования — типичный случай:
-            # запуск через process substitution (bash <(curl ...)),
-            # где $0 указывает на одноразовый канал (/dev/fd/N),
-            # который к этому моменту уже пуст (EOF). Копировать
-            # оттуда нечего — молча создавать 0-байтный файл нельзя,
-            # это хуже, чем вообще не установить команду.
+            # $0 — одноразовый канал (bash <(curl ...), /dev/fd/N): копировать нечего
             rm -f "/usr/local/bin/awgwarp.tmp" 2>/dev/null
         fi
         if [ -s "/usr/local/bin/awgwarp.tmp" ]; then
