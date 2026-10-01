@@ -9,7 +9,7 @@
 
 Каскадный VPN на основе Cloudflare WARP через AmneziaWG (Cascading VPN based on Cloudflare WARP via AmneziaWG).
 
-**Схема (Scheme):** `Клиент ← VPS ← AWG ← WARP`
+**Схема (Scheme):** `Client ← VPS ← AWG ← WARP`
 
 Для полноценной работы требуются права **root**. (Root privileges are required for full functionality)
 
